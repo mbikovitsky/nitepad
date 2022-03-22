@@ -1,147 +1,52 @@
-use std::{
-    os::windows::prelude::AsRawHandle,
-    panic::catch_unwind,
-    process::{Child, Command},
-};
+#![windows_subsystem = "windows"]
 
 use anyhow::{bail, Result};
 use windows::{
     core::{Error, PCWSTR},
     Win32::{
-        Foundation::{BOOL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WAIT_FAILED, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HINSTANCE, LPARAM, LRESULT, WAIT_FAILED, WPARAM},
         System::{
+            Environment::GetCommandLineW,
             LibraryLoader::{
                 GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             },
-            Threading::WaitForInputIdle,
+            Threading::{
+                CreateProcessW, GetExitCodeProcess, GetStartupInfoW, WaitForInputIdle,
+                WaitForSingleObject, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+                WAIT_OBJECT_0,
+            },
             WindowsProgramming::INFINITE,
         },
         UI::WindowsAndMessaging::{
-            EnumWindows, GetClassNameW, GetWindowThreadProcessId, SetWindowsHookExW,
-            UnhookWindowsHookEx, HHOOK, HOOKPROC, WH_GETMESSAGE, WINDOWS_HOOK_ID,
+            SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HOOKPROC, WH_GETMESSAGE, WINDOWS_HOOK_ID,
         },
     },
 };
 
-fn main() -> Result<()> {
-    let mut process = Command::new("C:\\Windows\\System32\\notepad.exe")
-        .args(std::env::args_os().skip(1))
-        .spawn()?;
-
-    wait_for_input_idle(&process)?;
-
-    let notepad_thread_id = find_notepad_thread(process.id())?;
-
-    let hook_module = get_image_base_from_function(get_message_hook as usize)?;
-
-    let _hook = unsafe {
-        WindowsHook::set(
-            WH_GETMESSAGE,
-            Some(get_message_hook),
-            hook_module,
-            notepad_thread_id,
-        )?
-    };
-
-    if !process.wait()?.success() {
-        bail!("Notepad returned error status");
-    }
-
-    Ok(())
+#[allow(dead_code)]
+struct ProcessInformation {
+    process_handle: HANDLE,
+    thread_handle: HANDLE,
+    pid: u32,
+    tid: u32,
 }
 
-fn wait_for_input_idle(process: &Child) -> Result<()> {
-    let wait_result =
-        unsafe { WaitForInputIdle(HANDLE(process.as_raw_handle() as isize), INFINITE) };
-    if wait_result == WAIT_FAILED.0 {
-        bail!(Error::from_win32());
-    }
-    if wait_result != 0 {
-        bail!("WaitForInputIdle failed");
-    }
-    Ok(())
-}
-
-fn find_notepad_thread(target_pid: u32) -> Result<u32> {
-    struct NotepadFindContext {
-        target_pid: u32,
-        found_tid: u32,
-    }
-
-    extern "system" fn find_notepad_thread_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let result = catch_unwind(|| unsafe {
-            let context = lparam.0 as *mut NotepadFindContext;
-            let context = context.as_mut().unwrap();
-
-            // The maximum length for lpszClassName is 256.
-            // https://docs.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-wndclassexw
-            let mut class_name = [0u16; 256 + 1];
-            let returned = GetClassNameW(hwnd, &mut class_name);
-            if returned == 0 {
-                return true;
-            }
-            let class_name = String::from_utf16(&class_name[..returned as usize]).unwrap();
-
-            if class_name != "Notepad" {
-                return true;
-            }
-
-            let mut process_id = 0;
-            let thread_id = GetWindowThreadProcessId(hwnd, &mut process_id);
-            if process_id == 0 || thread_id == 0 {
-                return true;
-            }
-
-            if process_id != context.target_pid {
-                return true;
-            }
-
-            context.found_tid = thread_id;
-            return false;
-        });
-        match result {
-            Ok(should_continue) => should_continue.into(),
-            Err(_) => false.into(),
+impl Drop for ProcessInformation {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.process_handle);
+            CloseHandle(self.thread_handle);
         }
     }
-
-    unsafe {
-        let mut find_context = NotepadFindContext {
-            target_pid,
-            found_tid: 0,
-        };
-        EnumWindows(
-            Some(find_notepad_thread_callback),
-            LPARAM(&mut find_context as *mut NotepadFindContext as isize),
-        );
-        if find_context.found_tid == 0 {
-            bail!("Target window not found");
-        }
-        Ok(find_context.found_tid)
-    }
 }
 
-fn get_image_base_from_function(function: usize) -> Result<HINSTANCE> {
-    unsafe {
-        let mut module = HINSTANCE(0);
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCWSTR(function as _),
-            &mut module,
-        )
-        .ok()?;
-        Ok(module)
-    }
-}
-
-#[derive(Debug)]
-pub struct WindowsHook {
+struct WindowsHook {
     hook: HHOOK,
 }
 
 impl WindowsHook {
-    pub unsafe fn set(
+    unsafe fn set(
         id: WINDOWS_HOOK_ID,
         function: HOOKPROC,
         module: HINSTANCE,
@@ -161,6 +66,104 @@ impl Drop for WindowsHook {
             UnhookWindowsHookEx(self.hook);
         }
     }
+}
+
+fn main() -> Result<()> {
+    std::process::exit(actual_main()? as i32);
+}
+
+fn actual_main() -> Result<u32> {
+    let process_info = create_notepad_process()?;
+
+    wait_for_input_idle(process_info.process_handle)?;
+
+    let hook_module = get_image_base_from_address(get_message_hook as usize)?;
+
+    let _hook = unsafe {
+        WindowsHook::set(
+            WH_GETMESSAGE,
+            Some(get_message_hook),
+            hook_module,
+            process_info.tid,
+        )?
+    };
+
+    wait_for_single_object(process_info.process_handle)?;
+
+    let exit_code = unsafe {
+        let mut exit_code = 0;
+        GetExitCodeProcess(process_info.process_handle, &mut exit_code).ok()?;
+        exit_code
+    };
+
+    Ok(exit_code)
+}
+
+fn create_notepad_process() -> Result<ProcessInformation> {
+    unsafe {
+        let command_line = GetCommandLineW();
+
+        let mut startup_info = STARTUPINFOW::default();
+        GetStartupInfoW(&mut startup_info);
+
+        let mut process_info = PROCESS_INFORMATION::default();
+
+        CreateProcessW(
+            "C:\\Windows\\System32\\notepad.exe",
+            command_line,
+            std::ptr::null(),
+            std::ptr::null(),
+            true,
+            PROCESS_CREATION_FLAGS(0),
+            std::ptr::null(),
+            None,
+            &startup_info,
+            &mut process_info,
+        )
+        .ok()?;
+
+        Ok(ProcessInformation {
+            process_handle: process_info.hProcess,
+            thread_handle: process_info.hThread,
+            pid: process_info.dwProcessId,
+            tid: process_info.dwThreadId,
+        })
+    }
+}
+
+fn wait_for_input_idle(process: HANDLE) -> Result<()> {
+    let wait_result = unsafe { WaitForInputIdle(process, INFINITE) };
+    if wait_result == WAIT_FAILED.0 {
+        bail!(Error::from_win32());
+    }
+    if wait_result != 0 {
+        bail!("WaitForInputIdle failed");
+    }
+    Ok(())
+}
+
+fn get_image_base_from_address(address: usize) -> Result<HINSTANCE> {
+    unsafe {
+        let mut module = HINSTANCE(0);
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(address as _),
+            &mut module,
+        )
+        .ok()?;
+        Ok(module)
+    }
+}
+
+fn wait_for_single_object(object: HANDLE) -> Result<()> {
+    let wait_result = unsafe { WaitForSingleObject(object, INFINITE) };
+    if wait_result == WAIT_FAILED.0 {
+        bail!(Error::from_win32())
+    }
+    if wait_result != WAIT_OBJECT_0 {
+        bail!("WaitForSingleObject failed");
+    }
+    Ok(())
 }
 
 #[link(name = "hook.dll")]
