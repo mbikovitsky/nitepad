@@ -1,2 +1,6 @@
 [workspace]
 members = ["nitepad", "hook"]
+
+[profile.release]
+debug = false
+strip = true
