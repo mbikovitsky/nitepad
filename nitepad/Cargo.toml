@@ -1,0 +1,22 @@
+[package]
+name = "nitepad"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+
+[dependencies.windows]
+version = "0.34.0"
+features = [
+    "alloc",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Environment",
+    "Win32_Security",
+]
