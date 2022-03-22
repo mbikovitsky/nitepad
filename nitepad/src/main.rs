@@ -166,7 +166,7 @@ fn wait_for_single_object(object: HANDLE) -> Result<()> {
     Ok(())
 }
 
-#[link(name = "hook.dll")]
+#[link(name = "nitepad_hook.dll")]
 extern "system" {
     fn get_message_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
 }
